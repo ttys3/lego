@@ -69,7 +69,7 @@ func TestNewDNSProvider(t *testing.T) {
 			require.NotNil(t, p)
 			require.NotNil(t, p.provider)
 
-			assert.IsType(t, p.provider, new(dnsProviderPublic))
+			assert.IsType(t, p.provider, new(dnsProvider))
 		})
 	}
 }
@@ -172,9 +172,9 @@ func TestNewDNSProviderConfig(t *testing.T) {
 			require.NotNil(t, p.provider)
 
 			if test.privateZone {
-				assert.IsType(t, p.provider, new(dnsProviderPrivate))
+				assert.IsType(t, p.provider, new(dnsProvider))
 			} else {
-				assert.IsType(t, p.provider, new(dnsProviderPublic))
+				assert.IsType(t, p.provider, new(dnsProvider))
 			}
 		})
 	}

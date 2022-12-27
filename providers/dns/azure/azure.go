@@ -5,13 +5,12 @@ package azure
 import (
 	"errors"
 	"fmt"
-	"io"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"net/http"
 	"time"
 
-	"github.com/Azure/go-autorest/autorest"
-	aazure "github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/azure/auth"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/platform/config/env"
 )
@@ -22,15 +21,16 @@ const defaultMetadataEndpoint = "http://169.254.169.254"
 const (
 	envNamespace = "AZURE_"
 
-	EnvEnvironment      = envNamespace + "ENVIRONMENT"
-	EnvMetadataEndpoint = envNamespace + "METADATA_ENDPOINT"
-	EnvSubscriptionID   = envNamespace + "SUBSCRIPTION_ID"
-	EnvResourceGroup    = envNamespace + "RESOURCE_GROUP"
-	EnvTenantID         = envNamespace + "TENANT_ID"
-	EnvClientID         = envNamespace + "CLIENT_ID"
-	EnvClientSecret     = envNamespace + "CLIENT_SECRET"
-	EnvZoneName         = envNamespace + "ZONE_NAME"
-	EnvPrivateZone      = envNamespace + "PRIVATE_ZONE"
+	EnvEnvironment = envNamespace + "ENVIRONMENT"
+
+	EnvSubscriptionID = envNamespace + "SUBSCRIPTION_ID"
+	EnvResourceGroup  = envNamespace + "RESOURCE_GROUP"
+	EnvTenantID       = envNamespace + "TENANT_ID"
+	EnvClientID       = envNamespace + "CLIENT_ID"
+	EnvClientSecret   = envNamespace + "CLIENT_SECRET"
+
+	EnvZoneName    = envNamespace + "ZONE_NAME"
+	EnvPrivateZone = envNamespace + "PRIVATE_ZONE"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
@@ -48,9 +48,9 @@ type Config struct {
 	ResourceGroup  string
 	PrivateZone    bool
 
-	MetadataEndpoint        string
-	ResourceManagerEndpoint string
-	ActiveDirectoryEndpoint string
+	MetadataEndpoint string
+
+	CloudConfig cloud.Configuration
 
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
@@ -61,12 +61,10 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		TTL:                     env.GetOrDefaultInt(EnvTTL, 60),
-		PropagationTimeout:      env.GetOrDefaultSecond(EnvPropagationTimeout, 2*time.Minute),
-		PollingInterval:         env.GetOrDefaultSecond(EnvPollingInterval, 2*time.Second),
-		MetadataEndpoint:        env.GetOrFile(EnvMetadataEndpoint),
-		ResourceManagerEndpoint: aazure.PublicCloud.ResourceManagerEndpoint,
-		ActiveDirectoryEndpoint: aazure.PublicCloud.ActiveDirectoryEndpoint,
+		TTL:                env.GetOrDefaultInt(EnvTTL, 60),
+		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 2*time.Minute),
+		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 2*time.Second),
+		CloudConfig:        cloud.AzurePublic,
 	}
 }
 
@@ -87,22 +85,24 @@ func NewDNSProvider() (*DNSProvider, error) {
 
 	environmentName := env.GetOrFile(EnvEnvironment)
 	if environmentName != "" {
-		var environment aazure.Environment
+		var environment cloud.Configuration
 		switch environmentName {
 		case "china":
-			environment = aazure.ChinaCloud
+			environment = cloud.AzureChina
 		case "german":
-			environment = aazure.GermanCloud
+			// see https://learn.microsoft.com/en-us/previous-versions/azure/germany/germany-developer-guide#endpoint-mapping
+			environment = cloud.Configuration{
+				ActiveDirectoryAuthorityHost: "https://login.microsoftonline.de/", Services: map[cloud.ServiceName]cloud.ServiceConfiguration{},
+			}
 		case "public":
-			environment = aazure.PublicCloud
+			environment = cloud.AzurePublic
 		case "usgovernment":
-			environment = aazure.USGovernmentCloud
+			environment = cloud.AzureGovernment
 		default:
 			return nil, fmt.Errorf("azure: unknown environment %s", environmentName)
 		}
 
-		config.ResourceManagerEndpoint = environment.ResourceManagerEndpoint
-		config.ActiveDirectoryEndpoint = environment.ActiveDirectoryEndpoint
+		config.CloudConfig = environment
 	}
 
 	config.SubscriptionID = env.GetOrFile(EnvSubscriptionID)
@@ -125,40 +125,25 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 		config.HTTPClient = http.DefaultClient
 	}
 
-	authorizer, err := getAuthorizer(config)
-	if err != nil {
-		return nil, err
-	}
-
 	if config.SubscriptionID == "" {
-		subsID, err := getMetadata(config, "subscriptionId")
-		if err != nil {
-			return nil, fmt.Errorf("azure: %w", err)
-		}
-
-		if subsID == "" {
-			return nil, errors.New("azure: SubscriptionID is missing")
-		}
-		config.SubscriptionID = subsID
+		return nil, errors.New("azure: SubscriptionID is missing")
 	}
 
 	if config.ResourceGroup == "" {
-		resGroup, err := getMetadata(config, "resourceGroupName")
-		if err != nil {
-			return nil, fmt.Errorf("azure: %w", err)
-		}
-
-		if resGroup == "" {
-			return nil, errors.New("azure: ResourceGroup is missing")
-		}
-		config.ResourceGroup = resGroup
+		return nil, errors.New("azure: ResourceGroup is missing")
 	}
 
-	if config.PrivateZone {
-		return &DNSProvider{provider: &dnsProviderPrivate{config: config, authorizer: authorizer}}, nil
+	clientOpts := azcore.ClientOptions{Cloud: cloud.AzureChina}
+	cred, err := azidentity.NewEnvironmentCredential(&azidentity.EnvironmentCredentialOptions{ClientOptions: clientOpts})
+	// cred, err := azidentity.NewClientSecretCredential(
+	// 	config.TenantID, config.ClientID, config.ClientSecret, &azidentity.ClientSecretCredentialOptions{ClientOptions: clientOpts},
+	// )
+
+	if err != nil {
+		return nil, fmt.Errorf("azidentity.NewEnvironmentCredential failed: %w", err)
 	}
 
-	return &DNSProvider{provider: &dnsProviderPublic{config: config, authorizer: authorizer}}, nil
+	return &DNSProvider{provider: &dnsProvider{config: config, authorizer: cred}}, nil
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
@@ -175,62 +160,4 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 // CleanUp removes the TXT record matching the specified parameters.
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	return d.provider.CleanUp(domain, token, keyAuth)
-}
-
-func getAuthorizer(config *Config) (autorest.Authorizer, error) {
-	if config.ClientID != "" && config.ClientSecret != "" && config.TenantID != "" {
-		credentialsConfig := auth.ClientCredentialsConfig{
-			ClientID:     config.ClientID,
-			ClientSecret: config.ClientSecret,
-			TenantID:     config.TenantID,
-			Resource:     config.ResourceManagerEndpoint,
-			AADEndpoint:  config.ActiveDirectoryEndpoint,
-		}
-
-		spToken, err := credentialsConfig.ServicePrincipalToken()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get oauth token from client credentials: %w", err)
-		}
-
-		spToken.SetSender(config.HTTPClient)
-
-		return autorest.NewBearerAuthorizer(spToken), nil
-	}
-
-	return auth.NewAuthorizerFromEnvironment()
-}
-
-// Fetches metadata from environment or he instance metadata service.
-// borrowed from https://github.com/Microsoft/azureimds/blob/master/imdssample.go
-func getMetadata(config *Config, field string) (string, error) {
-	metadataEndpoint := config.MetadataEndpoint
-	if metadataEndpoint == "" {
-		metadataEndpoint = defaultMetadataEndpoint
-	}
-
-	resource := fmt.Sprintf("%s/metadata/instance/compute/%s", metadataEndpoint, field)
-	req, err := http.NewRequest(http.MethodGet, resource, nil)
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Metadata", "True")
-
-	q := req.URL.Query()
-	q.Add("format", "text")
-	q.Add("api-version", "2017-12-01")
-	req.URL.RawQuery = q.Encode()
-
-	resp, err := config.HTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(respBody), nil
 }

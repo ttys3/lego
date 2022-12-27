@@ -4,30 +4,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/go-acme/lego/v4/providers/dns/azure/to"
 	"net/http"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/dns/mgmt/2017-09-01/dns"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/dns/armdns"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
 )
 
-// dnsProviderPublic implements the challenge.Provider interface for Azure Public Zone DNS.
-type dnsProviderPublic struct {
+// dnsProvider implements the challenge.Provider interface for Azure DNS.
+type dnsProvider struct {
 	config     *Config
-	authorizer autorest.Authorizer
+	authorizer *azidentity.EnvironmentCredential
 }
 
 // Timeout returns the timeout and interval to use when checking for DNS propagation.
 // Adjusting here to cope with spikes in propagation times.
-func (d *dnsProviderPublic) Timeout() (timeout, interval time.Duration) {
+func (d *dnsProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
 }
 
 // Present creates a TXT record to fulfill the dns-01 challenge.
-func (d *dnsProviderPublic) Present(domain, token, keyAuth string) error {
+func (d *dnsProvider) Present(domain, token, keyAuth string) error {
 	ctx := context.Background()
 	fqdn, value := dns01.GetRecord(domain, keyAuth)
 
@@ -36,8 +37,10 @@ func (d *dnsProviderPublic) Present(domain, token, keyAuth string) error {
 		return fmt.Errorf("azure: %w", err)
 	}
 
-	rsc := dns.NewRecordSetsClientWithBaseURI(d.config.ResourceManagerEndpoint, d.config.SubscriptionID)
-	rsc.Authorizer = d.authorizer
+	rsc, err := armdns.NewRecordSetsClient(d.config.SubscriptionID, d.authorizer, nil)
+	if err != nil {
+		return fmt.Errorf("azure: %w", err)
+	}
 
 	subDomain, err := dns01.ExtractSubDomain(fqdn, zone)
 	if err != nil {
@@ -45,9 +48,9 @@ func (d *dnsProviderPublic) Present(domain, token, keyAuth string) error {
 	}
 
 	// Get existing record set
-	rset, err := rsc.Get(ctx, d.config.ResourceGroup, zone, subDomain, dns.TXT)
+	rset, err := rsc.Get(ctx, d.config.ResourceGroup, zone, subDomain, armdns.RecordTypeTXT, nil)
 	if err != nil {
-		var detailed autorest.DetailedError
+		var detailed = &azcore.ResponseError{}
 		if !errors.As(err, &detailed) || detailed.StatusCode != http.StatusNotFound {
 			return fmt.Errorf("azure: %w", err)
 		}
@@ -55,30 +58,29 @@ func (d *dnsProviderPublic) Present(domain, token, keyAuth string) error {
 
 	// Construct unique TXT records using map
 	uniqRecords := map[string]struct{}{value: {}}
-	if rset.RecordSetProperties != nil && rset.TxtRecords != nil {
-		for _, txtRecord := range *rset.TxtRecords {
+	if rset.Properties != nil && rset.Properties.TxtRecords != nil {
+		for _, txtRecord := range rset.Properties.TxtRecords {
 			// Assume Value doesn't contain multiple strings
-			values := to.StringSlice(txtRecord.Value)
-			if len(values) > 0 {
-				uniqRecords[values[0]] = struct{}{}
+			if len(txtRecord.Value) > 0 && txtRecord.Value[0] != nil {
+				uniqRecords[*txtRecord.Value[0]] = struct{}{}
 			}
 		}
 	}
 
-	var txtRecords []dns.TxtRecord
+	var txtRecords []*armdns.TxtRecord
 	for txt := range uniqRecords {
-		txtRecords = append(txtRecords, dns.TxtRecord{Value: &[]string{txt}})
+		txtRecords = append(txtRecords, &armdns.TxtRecord{Value: []*string{&txt}})
 	}
 
-	rec := dns.RecordSet{
+	rec := armdns.RecordSet{
 		Name: &subDomain,
-		RecordSetProperties: &dns.RecordSetProperties{
+		Properties: &armdns.RecordSetProperties{
 			TTL:        to.Int64Ptr(int64(d.config.TTL)),
-			TxtRecords: &txtRecords,
+			TxtRecords: txtRecords,
 		},
 	}
 
-	_, err = rsc.CreateOrUpdate(ctx, d.config.ResourceGroup, zone, subDomain, dns.TXT, rec, "", "")
+	_, err = rsc.CreateOrUpdate(ctx, d.config.ResourceGroup, zone, subDomain, armdns.RecordTypeTXT, rec, nil)
 	if err != nil {
 		return fmt.Errorf("azure: %w", err)
 	}
@@ -86,7 +88,7 @@ func (d *dnsProviderPublic) Present(domain, token, keyAuth string) error {
 }
 
 // CleanUp removes the TXT record matching the specified parameters.
-func (d *dnsProviderPublic) CleanUp(domain, token, keyAuth string) error {
+func (d *dnsProvider) CleanUp(domain, token, keyAuth string) error {
 	ctx := context.Background()
 	fqdn, _ := dns01.GetRecord(domain, keyAuth)
 
@@ -100,10 +102,12 @@ func (d *dnsProviderPublic) CleanUp(domain, token, keyAuth string) error {
 		return fmt.Errorf("azure: %w", err)
 	}
 
-	rsc := dns.NewRecordSetsClientWithBaseURI(d.config.ResourceManagerEndpoint, d.config.SubscriptionID)
-	rsc.Authorizer = d.authorizer
+	rsc, err := armdns.NewRecordSetsClient(d.config.SubscriptionID, d.authorizer, nil)
+	if err != nil {
+		return fmt.Errorf("azure: %w", err)
+	}
 
-	_, err = rsc.Delete(ctx, d.config.ResourceGroup, zone, subDomain, dns.TXT, "")
+	_, err = rsc.Delete(ctx, d.config.ResourceGroup, zone, subDomain, armdns.RecordTypeTXT, nil)
 	if err != nil {
 		return fmt.Errorf("azure: %w", err)
 	}
@@ -111,7 +115,7 @@ func (d *dnsProviderPublic) CleanUp(domain, token, keyAuth string) error {
 }
 
 // Checks that azure has a zone for this domain name.
-func (d *dnsProviderPublic) getHostedZoneID(ctx context.Context, fqdn string) (string, error) {
+func (d *dnsProvider) getHostedZoneID(ctx context.Context, fqdn string) (string, error) {
 	if zone := env.GetOrFile(EnvZoneName); zone != "" {
 		return zone, nil
 	}
@@ -121,10 +125,12 @@ func (d *dnsProviderPublic) getHostedZoneID(ctx context.Context, fqdn string) (s
 		return "", err
 	}
 
-	dc := dns.NewZonesClientWithBaseURI(d.config.ResourceManagerEndpoint, d.config.SubscriptionID)
-	dc.Authorizer = d.authorizer
+	dc, err := armdns.NewZonesClient(d.config.SubscriptionID, d.authorizer, nil)
+	if err != nil {
+		return "", err
+	}
 
-	zone, err := dc.Get(ctx, d.config.ResourceGroup, dns01.UnFqdn(authZone))
+	zone, err := dc.Get(ctx, d.config.ResourceGroup, dns01.UnFqdn(authZone), nil)
 	if err != nil {
 		return "", err
 	}
